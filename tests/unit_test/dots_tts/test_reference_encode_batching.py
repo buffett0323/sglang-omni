@@ -98,6 +98,11 @@ def _install_waveforms(
     )
 
 
+def _set_tf32(monkeypatch: pytest.MonkeyPatch, *, enabled: bool) -> None:
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", enabled)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", enabled)
+
+
 def test_batch_of_one_is_identical_to_the_unbatched_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -293,6 +298,7 @@ def test_encoder_coalesces_equal_length_references_into_one_forward(
 
     from sglang_omni.models.dots_tts.codec import DotsReferenceEncoder
 
+    _set_tf32(monkeypatch, enabled=False)
     codec = _make_codec()
     # Same duration, different content: the case batching can actually help.
     waveforms = {
@@ -339,6 +345,7 @@ def test_encoder_handles_all_distinct_lengths_without_padding(
 
     from sglang_omni.models.dots_tts.codec import DotsReferenceEncoder
 
+    _set_tf32(monkeypatch, enabled=False)
     codec = _make_codec()
     waveforms = {
         f"ref-{index}.wav": _waveform(4 + index, seed=40 + index) for index in range(4)
@@ -367,6 +374,63 @@ def test_encoder_handles_all_distinct_lengths_without_padding(
                 ), name
     finally:
         encoder.close()
+
+
+def test_cuda_reference_batching_is_disabled_with_default_cudnn_tf32(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.dots_tts.codec import DotsReferenceEncoder
+
+    _set_tf32(monkeypatch, enabled=False)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", True)
+    codec = _make_codec()
+    codec.device = torch.device("cuda")
+    encoder = DotsReferenceEncoder(codec, model_id="stub", max_batch_size=8)
+    try:
+        assert encoder.service.batching_enabled is False
+    finally:
+        encoder.close()
+
+
+def test_reference_executor_defaults_to_per_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.dots_tts import stages
+
+    _set_tf32(monkeypatch, enabled=False)
+    codec = _make_codec()
+    monkeypatch.setattr(
+        stages, "load_dots_audio_codec", lambda *_args, **_kwargs: codec
+    )
+
+    scheduler = stages.create_reference_encode_executor("stub", device="cpu")
+    try:
+        encoder = scheduler._fn.__self__
+        assert encoder.service.batching_enabled is False
+    finally:
+        scheduler.stop()
+
+
+def test_reference_executor_stop_closes_batch_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.dots_tts import stages
+
+    _set_tf32(monkeypatch, enabled=False)
+    codec = _make_codec()
+    monkeypatch.setattr(
+        stages, "load_dots_audio_codec", lambda *_args, **_kwargs: codec
+    )
+    scheduler = stages.create_reference_encode_executor(
+        "stub", device="cpu", max_batch_size=2
+    )
+    encoder = scheduler._fn.__self__
+    assert encoder.service._batch_thread is not None
+    assert encoder.service._batch_thread.is_alive()
+
+    scheduler.stop()
+
+    assert not encoder.service._batch_thread.is_alive()
 
 
 # --------------------------------------------------------------------------

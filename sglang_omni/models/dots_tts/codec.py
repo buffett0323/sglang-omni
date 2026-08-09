@@ -235,7 +235,11 @@ class _DotsReferenceHook(KeyedReferenceEncodeHook[str, dict, dict]):
         return self.codec.encode_reference(item)
 
     def can_encode_batch(self) -> bool:
-        return True
+        if self.codec.device.type != "cuda":
+            return True
+        return not (
+            torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
+        )
 
     def encode_batch(self, items: list[str]) -> list[dict]:
         return self.codec.encode_reference_batch(list(items))
