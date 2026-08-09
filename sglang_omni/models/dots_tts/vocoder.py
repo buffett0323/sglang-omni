@@ -16,6 +16,7 @@ from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
 from sglang_omni.scheduling.vocoder_base import BatchVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
+from sglang_omni.utils.lock_profile import labeled
 
 _LENGTH_BUCKET_FRAMES = 32
 logger = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ class DotsTTSBatchVocoder(BatchVocoderBase):
             )
             self._logged_batch = True
 
-        with self.codec.lock:
+        with labeled(self.codec.lock, "vocoder_batch_decode"):
             for bucket_items in buckets.values():
                 frame_counts = [int(latents.shape[1]) for _, latents in bucket_items]
                 max_frames = max(frame_counts)
@@ -90,6 +91,7 @@ class DotsTTSBatchVocoder(BatchVocoderBase):
 
         if any(output is None for output in outputs):
             raise RuntimeError("dots.tts AudioVAE did not produce every batch result")
+        self.codec.maybe_log_lock_stats()
         return [output for output in outputs if output is not None]
 
     def _validate_latents(self, latents: torch.Tensor) -> None:
@@ -173,7 +175,7 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
 
     def create_stream_state(self, request_id: str) -> _DotsStreamState:
         del request_id
-        with self.codec.lock:
+        with labeled(self.codec.lock, "stream_state_init"):
             codec_state = self.codec.inference.init_stream_state(
                 batch_size=1,
                 chunk_size=self.codec.patch_size * self.merge_steps,
@@ -229,7 +231,7 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
             )
             # note (db-ol): compiled stream step cudagraph trees corrupt the
             # backbone decode graph replay in this process, see issue 1392.
-            with self.codec.lock:
+            with labeled(self.codec.lock, "stream_step"):
                 chunk = self.codec.inference.stream_step(
                     latent_chunk,
                     stream_state=state.codec_state,
@@ -239,10 +241,11 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
             if chunk.numel():
                 chunks.append(chunk)
         if is_final:
-            with self.codec.lock:
+            with labeled(self.codec.lock, "stream_flush"):
                 tail = self.codec.inference.flush(state.codec_state)
             if tail.numel():
                 chunks.append(tail)
+            self.codec.maybe_log_lock_stats()
         if not chunks:
             return None
         return torch.cat(chunks, dim=-1)
@@ -268,7 +271,7 @@ class DotsTTSStreamingVocoder(StreamingVocoderBase[_DotsStreamState, None]):
         tts_state = load_dots_tts_state(payload)
         if tts_state.generated_latents is None:
             return None
-        with self.codec.lock:
+        with labeled(self.codec.lock, "stream_fallback_decode"):
             return self.codec.inference.decode_latents(
                 tts_state.generated_latents.to(self.codec.device)
             )
