@@ -34,12 +34,13 @@ class _FakeCodec:
     def __init__(self) -> None:
         self.inference = _RecordingInference()
         self.lock = threading.Lock()
+        self.spans = None
         self.sample_rate = 48000
         self.patch_size = 3
         self.latent_dim = 5
         self.device = "cpu"
 
-    def maybe_log_lock_stats(self) -> None:
+    def maybe_log_contention(self) -> None:
         pass
 
 
