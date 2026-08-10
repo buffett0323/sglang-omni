@@ -38,6 +38,9 @@ class _FakeCodec:
         self.latent_dim = 5
         self.device = "cpu"
 
+    def maybe_log_lock_stats(self) -> None:
+        pass
+
 
 def test_streaming_never_uses_the_compiled_stream_step() -> None:
     codec = _FakeCodec()
