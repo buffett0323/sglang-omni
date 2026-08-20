@@ -194,7 +194,7 @@ class DotsTTSStreamingVocoder(
 
     def ensure_slot_pool(self) -> DotsVocoderSlotPool:
         """Allocate the slot pool at executor setup (not the first live chunk)."""
-        with self.codec.lock:
+        with labeled(self.codec.lock, "stream_pool_init"):
             return self._get_or_create_pool_locked()
 
     def validate_non_streaming_payload(self, payload: StagePayload) -> None:
@@ -203,12 +203,9 @@ class DotsTTSStreamingVocoder(
 
     def create_stream_state(self, request_id: str) -> _DotsStreamState:
         del request_id
-        with labeled(self.codec.lock, "stream_state_init"):
-            codec_state = self.codec.inference.init_stream_state(
-                batch_size=1,
-                chunk_size=self.codec.patch_size * self.merge_steps,
-            )
-        return _DotsStreamState(codec_state=codec_state)
+        # note: per-stream codec state lives in the slot pool, so state creation
+        # takes no codec lock and has no site to label.
+        return _DotsStreamState()
 
     def validate_chunk(
         self,
@@ -254,7 +251,7 @@ class DotsTTSStreamingVocoder(
         if not is_final:
             return None
         chunks: list[torch.Tensor] = []
-        with self.codec.lock:
+        with labeled(self.codec.lock, "stream_flush"):
             pool = self._get_or_create_pool_locked()
             if state.slot is None and state.pending:
                 state.slot = pool.acquire()
@@ -273,6 +270,7 @@ class DotsTTSStreamingVocoder(
                 state.slot = None
                 if tail.numel():
                     chunks.append(tail)
+        self.codec.maybe_log_lock_stats()
         if not chunks:
             return None
         return torch.cat(chunks, dim=-1)
@@ -309,7 +307,7 @@ class DotsTTSStreamingVocoder(
         del request_id
         if state.slot is None:
             return
-        with self.codec.lock:
+        with labeled(self.codec.lock, "stream_release"):
             self._get_or_create_pool_locked().release(state.slot)
         state.slot = None
 
@@ -359,7 +357,7 @@ class DotsTTSStreamingVocoder(
         participants: list[tuple[str, _DotsStreamState]],
         plan: _DotsCoalescedStepPlan,
     ) -> dict[str, torch.Tensor]:
-        with self.codec.lock:
+        with labeled(self.codec.lock, "stream_step"):
             decoded = self._get_or_create_pool_locked().step(plan.slot_latents)
         out: dict[str, torch.Tensor] = {}
         for request_id, state in participants:
@@ -391,7 +389,7 @@ class DotsTTSStreamingVocoder(
     def _ensure_slot(self, state: _DotsStreamState) -> None:
         if state.slot is not None:
             return
-        with self.codec.lock:
+        with labeled(self.codec.lock, "stream_slot_acquire"):
             if state.slot is None:
                 state.slot = self._get_or_create_pool_locked().acquire()
 
