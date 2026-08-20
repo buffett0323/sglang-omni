@@ -23,6 +23,7 @@ from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,
     Qwen3OmniMoeTalkerTextConfig,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.quantization import get_weight_preprocessor
 from sglang_omni.sampling.seed import (
     SAMPLING_SEED_MASK,
@@ -447,7 +448,7 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         )
 
         # Decoder layers
-        alt_stream = torch.cuda.Stream()
+        alt_stream = torch.cuda.Stream() if current_platform.is_cuda() else None
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Qwen3OmniMoeTalkerDecoderLayer(
@@ -578,7 +579,7 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         )
 
         # 5 dense decoder layers
-        alt_stream = torch.cuda.Stream()
+        alt_stream = torch.cuda.Stream() if current_platform.is_cuda() else None
         self.model.layers = nn.ModuleList()
         for idx in range(cp_config.num_hidden_layers):
             # Create a decoder layer similar to Thinker but with dense MLP
@@ -857,6 +858,11 @@ class Qwen3OmniTalker(nn.Module):
             isinstance(layer.self_attn.rotary_emb, MRotaryEmbedding)
             for layer in self.model.layers
         )
+        # The prefill CUDA graph runner picks capture-time positions by probing
+        # this; if it disagrees with forward() below, MRotaryEmbedding takes its
+        # out-of-place path and the rebuilt q/k do not survive a graph-segment
+        # boundary, leaving attention to run on zeros.
+        self.is_mrope_enabled = self._uses_mrope
         self.codec_head = ReplicatedLinear(
             config.text_config.hidden_size,
             config.text_config.vocab_size,
@@ -973,7 +979,7 @@ class Qwen3OmniTalker(nn.Module):
             device=device,
         )
         self._sampling_staging_event = (
-            torch.cuda.Event() if device.type == "cuda" else None
+            torch.get_device_module().Event() if device.type != "cpu" else None
         )
         self._decode_prep_rids: list | None = None
         self._decode_prep_out_lens: list[int] = []
@@ -1220,6 +1226,7 @@ class Qwen3OmniTalker(nn.Module):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
         input_deepstack_mask: Optional[torch.Tensor] = None,
         input_embeds_are_projected: bool = False,
+        omni_prefill_rids: Optional[list[str] | tuple[str, ...]] = None,
     ):
         """Forward pass through the talker MoE backbone.
 
@@ -1235,10 +1242,13 @@ class Qwen3OmniTalker(nn.Module):
             input_deepstack_embeds: optional layer-N thinker hidden states
             input_deepstack_mask: positions that should use hidden_projection
             input_embeds_are_projected: whether `input_embeds` is already in talker space
+            omni_prefill_rids: request ids SGLModelRunner forwards alongside the
+                Omni prefill sidecar; the talker keys nothing off them
 
         Returns:
             LogitsProcessorOutput with codec logits
         """
+        del omni_prefill_rids
         if forward_batch.forward_mode.is_extend():
             self.invalidate_decode_buffers()
 
@@ -1381,7 +1391,7 @@ class Qwen3OmniTalker(nn.Module):
             custom_params=None,
             custom_logit_processor=None,
             sampling_seed=self._sampling_seeds[:batch_size],
-            device="cuda",
+            device=current_platform.device_type,
             logit_bias=None,
         )
 
